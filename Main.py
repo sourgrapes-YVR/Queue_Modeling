@@ -7,6 +7,9 @@ os.environ['TCL_LIBRARY'] = os.path.join(python_root, 'tcl', 'tcl8.6')
 os.environ['TK_LIBRARY'] = os.path.join(python_root, 'tcl', 'tk8.6')
 import salabim as sim
 import random
+import math
+
+env = sim.Environment(trace=True)
 
 direct_to_EMD = ['purple','red', 'orange','yellow']
 teal_calls = ['teal']
@@ -14,17 +17,47 @@ teal_calls = ['teal']
 # % of calls that an STC closes
 stc_closure_rate = 0.2
 
-# set number of resources
-stc_count = 2
-calltaker_count = 10
-ambulance_count = 50
-reassessor_count = 2
+stc_resource = sim.Resource('STC', capacity=3)
+stc_schedule = [
+    #time in mins since start, number of STC
+    (0,3),
+    (360,6),
+    (720,3),
+]
+
+
+calltaker_resource = sim.Resource('Calltaker', capacity=10)
+calltaker_schedule = [
+    #time in mins since start, number of STC
+    (0,10),
+    (60,12),
+    (360,14),
+    (720,10),
+]
+
+ambulance_resource = sim.Resource('Ambulance', capacity=50)
+ambulance_schedule = [
+    #time in mins since start, number of STC
+    (0,50),
+    (60,65),
+    (120,75),
+    (360,85),
+    (720,60),
+]
+
+reassessor_resource = sim.Resource('Rea', capacity=2)
+reassessor_schedule = [
+    #time in mins since start, number of STC
+    (0,2),
+    (360,3),
+    (720,2),
+]
 
 #Misc variables
 teal_max_wait = 30 #longest time teal call will wait in tealQ
 rea_timeframe = 30
 rural_remote_stc = True
-env = sim.Environment(trace=True)
+
 
 #monitors for available resources:
 active_stc_monitor = sim.Monitor(name='Active STC', level=True, initial_tally=0)
@@ -55,7 +88,16 @@ class CallGenerator(sim.Component):
     def process(self):
         while True:
             MPDS_Call()
-            self.hold(sim.Uniform(0.8, 2).sample())
+            hour_of_day = ((self.env.now()/60)%24) + 6 # start day at 6am
+            rate = self.get_hourly_rate(hour_of_day)
+            self.hold(sim.Exponential(60/rate))
+
+    def get_hourly_rate(self, hour):
+        base_rate = 66.7  # average
+        amplitude = 25  # variation
+        peak_hour = 16  # 4pm peak
+
+        return base_rate + amplitude * math.sin((hour - peak_hour + 6) * math.pi / 12)
 
 class MPDS_Call(sim.Component):
     def setup(self):
@@ -138,30 +180,55 @@ class STC(sim.Component):
         while True:
             while len(teal_Q) == 0:
                 self.passivate()
+            self.request(stc_resource)
             active_stc_monitor.tally(active_stc_monitor.value + 1)
+            
+            # Re-check queue after acquiring resource (another process may have taken the item)
+            if len(teal_Q) == 0:
+                active_stc_monitor.tally(active_stc_monitor.value - 1)
+                self.release(stc_resource)
+                continue  # Go back to waiting for items in teal_Q
+            
             self.MPDS_Call = teal_Q.pop()
+            
+            # Additional safety check in case pop() still returns None
+            if self.MPDS_Call is None:
+                active_stc_monitor.tally(active_stc_monitor.value - 1)
+                self.release(stc_resource)
+                continue
+            
             self.hold(25)
             self.MPDS_Call.processed_by_stc = True
             self.MPDS_Call.activate()
             active_stc_monitor.tally(active_stc_monitor.value - 1)
+            self.release(stc_resource)
 
 
 class ambulance(sim.Component):
     def process(self):
         while True:
-            # Find a call from any queue (check ALL queues first)
+            # Check if any queue has calls before requesting resource
+            any_calls = any(len(queue) > 0 for queue in colour_queues.values())
+            if not any_calls:
+                self.passivate()
+                continue
+            self.request(ambulance_resource)
+            # Re-check queues after acquiring resource (another process may have taken items)
             call_found = False
             for queue in colour_queues.values():
                 if len(queue) > 0:
-                    active_ambulance_monitor.tally(active_ambulance_monitor.value + 1)
                     self.MPDS_Call = queue.pop()
-                    
+
+                    # Additional safety check in case pop() returns None
+                    if self.MPDS_Call is None:
+                        continue
+                    active_ambulance_monitor.tally(active_ambulance_monitor.value + 1)
                     # Stop the reassessment timer and remove from rea_Q
                     if hasattr(self.MPDS_Call, 'reassessment_timer') and self.MPDS_Call.reassessment_timer:
                         self.MPDS_Call.reassessment_timer.active = False
                     if self.MPDS_Call in rea_Q:
                         rea_Q.remove(self.MPDS_Call)
-                    
+
                     if self.MPDS_Call.colour in ['purple', 'red']:
                         self.hold(90)
                     elif self.MPDS_Call.colour in ['orange', 'yellow']:
@@ -171,21 +238,34 @@ class ambulance(sim.Component):
                     call_found = True
                     break  # Handle one call, then loop back to check queues again
 
-            # Only passivate if NO queues have any calls
+            self.release(ambulance_resource)
+
+            # If no call was found after acquiring resource, loop back
             if not call_found:
-                self.passivate()
+                continue
+
 
 class calltaker(sim.Component):
     def process(self):
         while True:
             while len(emct_Q) == 0:
                 self.passivate()
+            self.request(calltaker_resource)
+            # Re-check queue after acquiring resource (another process may have taken the item)
+            if len(emct_Q) == 0:
+                self.release(calltaker_resource)
+                continue  # Go back to waiting for items in emct_Q
             self.current_call = emct_Q.pop()
+            # Additional safety check in case pop() returns None
+            if self.current_call is None:
+                self.release(calltaker_resource)
+                continue
             active_emct_monitor.tally(active_emct_monitor.value + 1)
             self.hold(sim.Uniform(1, 10).sample())
             self.current_call.colour = random.choices(population=event_colours, weights=[3, 35, 28, 32, 2], k=1)[0]
             self.current_call.activate()
             active_emct_monitor.tally(active_emct_monitor.value - 1)
+            self.release(calltaker_resource)
 
 
 class ReassessmentTimer(sim.Component):
@@ -195,7 +275,6 @@ class ReassessmentTimer(sim.Component):
     def process(self):
         while self.active:
             self.hold(rea_timeframe)
-
             if self.active and self.call in colour_queues.get(self.call.colour, []):
                 if self.call not in rea_Q:
                     self.call.enter(rea_Q)
@@ -212,15 +291,26 @@ class ReassessmentEMCT(sim.Component):
         while True:
             while len(rea_Q) == 0:
                 self.passivate()
+
+            self.request(reassessor_resource)
+
+            # Re-check queue after acquiring resource (another process may have taken the item)
+            if len(rea_Q) == 0:
+                self.release(reassessor_resource)
+                continue  # Go back to waiting for items in rea_Q
             patient = rea_Q.pop()
+            # Additional safety check in case pop() returns None
+            if patient is None:
+                self.release(reassessor_resource)
+                continue
             active_reassessor_monitor.tally(active_reassessor_monitor.value + 1)
-            self.hold(sim.Triangular(2,5,4).sample())
+            self.hold(sim.Triangular(2, 5, 4).sample())
             still_waiting = patient in colour_queues.get(patient.colour, [])
             if sim.Uniform(0, 1).sample() < 0.05:
                 patient.reassessment_timer.active = False
                 patient.cancel()
             elif still_waiting:
-                # this whole try/except block is dumb - I get an error when I tried to just do enter that some calls were already in there despite being popped minutes ago.
+                # This whole try/except block is dumb - I get an error when I tried to just do enter that some calls were already in there despite being popped minutes ago.
                 try:
                     patient.leave(rea_Q)
                 except ValueError:
@@ -228,6 +318,18 @@ class ReassessmentEMCT(sim.Component):
                 finally:
                     patient.enter(rea_Q)
             active_reassessor_monitor.tally(active_reassessor_monitor.value - 1)
+            self.release(reassessor_resource)
+
+
+class ResourceScheduler(sim.Component):
+    def setup(self, resource, schedule):
+        self.resource = resource
+        self.schedule = sorted(schedule)
+
+    def process(self):
+            for change_time, count in self.schedule:
+                self.hold(till=change_time)
+                self.resource.set_capacity(count)
 
 env.processed_count = 0
 env.teal_bounces = 0
@@ -236,11 +338,25 @@ env.animate(True)
 
 CallGenerator()
 
-STCs = [STC() for _ in range(stc_count)]
-Ambulances = [ambulance() for _ in range(ambulance_count)]
-Calltakers = [calltaker() for _ in range(calltaker_count)]
-Reassessors = [ReassessmentEMCT() for _ in range(reassessor_count)]
+STCs = [STC() for _ in range(10)]
+ResourceScheduler(resource = stc_resource, schedule = stc_schedule)
+Ambulances = [ambulance() for _ in range(100)]
+ResourceScheduler(resource = ambulance_resource, schedule = ambulance_schedule)
+Calltakers = [calltaker() for _ in range(50)]
+ResourceScheduler(resource = calltaker_resource, schedule = calltaker_schedule)
+Reassessors = [ReassessmentEMCT() for _ in range(10)]
+ResourceScheduler(resource = reassessor_resource, schedule = reassessor_schedule)
 
+
+
+#Clock
+sim.AnimateText(
+    text=lambda: f"Time: {(int(divmod(env.now()/60, 24)[1])+6):02d}:{int(env.now() % 60):02d}",
+    x=510,
+    y=690,
+    fontsize=20,
+    textcolor='black'
+)
 
 #Teal Q visual
 sim.AnimateText(
@@ -331,7 +447,7 @@ sim.AnimateText(
     textcolor='teal'
 )
 sim.AnimateText(
-    text=lambda: f"Available STC: {stc_count-(active_stc_monitor.value)}",
+    text=lambda: f"Available STC: {stc_resource.capacity()-(active_stc_monitor.value)}",
     x=50,
     y=460,
     fontsize=20,
@@ -363,7 +479,7 @@ sim.AnimateText(
     textcolor='black'
 )
 sim.AnimateText(
-    text=lambda: f"Available Ambulances: {ambulance_count-(active_ambulance_monitor.value)}",
+    text=lambda: f"Available Ambulances: {ambulance_resource.capacity()-(active_ambulance_monitor.value)}",
     x=300,
     y=460,
     fontsize=20,
@@ -379,7 +495,7 @@ sim.AnimateText(
     textcolor='black'
 )
 sim.AnimateText(
-    text=lambda: f"Available REA: {reassessor_count-(active_reassessor_monitor.value)}",
+    text=lambda: f"Available REA: {reassessor_resource.capacity()-(active_reassessor_monitor.value)}",
     x=300,
     y=390,
     fontsize=20,
@@ -408,7 +524,7 @@ sim.AnimateText(
     textcolor='black'
 )
 sim.AnimateText(
-    text=lambda: f"Available EMCT: {(calltaker_count-(active_emct_monitor.value))}",
+    text=lambda: f"Available EMCT: {(calltaker_resource.capacity()-(active_emct_monitor.value))}",
     x=300,
     y=240,
     fontsize=20,
@@ -441,7 +557,7 @@ sim.AnimateButton(text="100x", x=260, y=700, action=set_speed_100)
 
 
 try:
-    env.run(till=10000)
+    env.run(till=1440)
 except sim.SimulationStopped:
     print("\nSimulation was stopped by user (animation window closed).")
     print(f"Simulation ended at time: {env.now()}")
