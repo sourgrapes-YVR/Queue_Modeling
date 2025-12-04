@@ -17,19 +17,20 @@ stc_closure_rate = 0.2
 # set number of resources
 stc_count = 2
 calltaker_count = 10
-ambulance_count = 40
-reassessor_count = 1
+ambulance_count = 50
+reassessor_count = 2
 
 #Misc variables
 teal_max_wait = 30 #longest time teal call will wait in tealQ
 rea_timeframe = 30
-
+rural_remote_stc = True
 env = sim.Environment(trace=True)
 
 #monitors for available resources:
 active_stc_monitor = sim.Monitor(name='Active STC', level=True, initial_tally=0)
 active_ambulance_monitor = sim.Monitor(name='Active Ambulances', level=True, initial_tally=0)
 active_reassessor_monitor = sim.Monitor(name='Active REA EMCT', level=True, initial_tally=0)
+active_emct_monitor = sim.Monitor(name='Active EMCT', level=True, initial_tally=0)
 
 #Create the queues
 emct_Q = sim.Queue('emct_Q')
@@ -50,58 +51,87 @@ colour_queues = {
     'yellow': yellow_Q
 }
 
-
 class CallGenerator(sim.Component):
     def process(self):
         while True:
             MPDS_Call()
-            self.hold(sim.Uniform(1, 2).sample())
+            self.hold(sim.Uniform(0.8, 2).sample())
 
 class MPDS_Call(sim.Component):
     def setup(self):
+        self.rural_remote = random.choices(population=[True, False], weights=[0.3, 0.7], k=1)[0]
         self.processed_by_stc = False
         self.colour = None
+
     def process(self):
         # Get processed by an EMCT
         self.enter(emct_Q)
-        for calltaker in Calltakers:
-            if calltaker.ispassive():
-                calltaker.activate()
+        self._activate_first_passive(Calltakers)
+        self.passivate()
+        # wait to be reactivated by a calltaker wrapping up with you
+        self._determine_colour()
+        if self.colour in teal_calls:
+            self._handle_teal_call()
+        elif self.colour in direct_to_EMD:
+            self._handle_dispatchable_call()
+
+        self.passivate()
+
+    def _activate_first_passive(self, components):
+        for component in components:
+            if component.ispassive():
+                component.activate()
                 break
-        self.passivate()
-        # if it's dispatchable, send it out
-        if self.colour in direct_to_EMD:
-            self.enter(colour_queues[self.colour])
-            # Create a reassessment timer for this call
-            self.reassessment_timer = ReassessmentTimer(call=self)
-            for ambulance in Ambulances:
-                if ambulance.ispassive():
-                    ambulance.activate()
-                    break
-        # if it's teal, send to teal Q
-        elif self.colour in teal_calls:
-            self.enter(teal_Q)
-            # if STC available, send to them
-            for stc in STCs:
-                if stc.ispassive():
-                    stc.activate()
-                    break
-            # if no STC, wait up to 30 mins then if still in teal Q send to pending
-            self.hold(teal_max_wait)
-            if self in teal_Q:
-                self.leave(teal_Q)
-                env.teal_bounces += 1
-                self.colour = 'yellow'
-                self.enter(yellow_Q)
-            elif self.processed_by_stc:
-                # STC handled this call - check if cancelled or goes to pending
-                if random.random() < stc_closure_rate:
-                    env.stc_closed_count += 1  # Successfully cancelled
-                    self.cancel()
-                else:
-                    self.colour = 'yellow'
-                    self.enter(yellow_Q)  # Still needs dispatch
-        self.passivate()
+
+    def _determine_colour(self):
+        gets_screened_in = (
+                rural_remote_stc == True
+                and self.rural_remote == True
+                and self.colour == 'yellow'
+        )
+        if gets_screened_in:
+            self.colour = 'teal'
+        else:
+            self.colour = random.choices(
+                population=event_colours,
+                weights=[3, 35, 28, 32, 2],
+                k=1
+            )[0]
+
+    def _handle_dispatchable_call(self):
+        self.enter(colour_queues[self.colour])
+        self.reassessment_timer = ReassessmentTimer(call=self)
+        self._activate_first_passive(Ambulances)
+
+    def _handle_teal_call(self):
+        self.enter(teal_Q)
+        self._activate_first_passive(STCs)
+        self.hold(teal_max_wait)
+
+        if self in teal_Q:
+            self._handle_teal_timeout()
+        elif self.processed_by_stc:
+            self._handle_stc_processed_call()
+
+    def _handle_teal_timeout(self):
+        # Move calls from teal to yellow after waiting too long to be assessed
+        self.leave(teal_Q)
+        env.teal_bounces += 1
+        self._send_to_yellow_queue()
+
+    def _handle_stc_processed_call(self):
+        # either close the call or cancel depending on STC closure rate
+        if random.random() < stc_closure_rate:
+            env.stc_closed_count += 1
+            self.cancel()
+        else:
+            self._send_to_yellow_queue()
+
+    def _send_to_yellow_queue(self):
+        """Send the call to the yellow queue for dispatch."""
+        self.colour = 'yellow'
+        self.enter(yellow_Q)
+
 
 class STC(sim.Component):
     def process(self):
@@ -125,6 +155,13 @@ class ambulance(sim.Component):
                 if len(queue) > 0:
                     active_ambulance_monitor.tally(active_ambulance_monitor.value + 1)
                     self.MPDS_Call = queue.pop()
+                    
+                    # Stop the reassessment timer and remove from rea_Q
+                    if hasattr(self.MPDS_Call, 'reassessment_timer') and self.MPDS_Call.reassessment_timer:
+                        self.MPDS_Call.reassessment_timer.active = False
+                    if self.MPDS_Call in rea_Q:
+                        rea_Q.remove(self.MPDS_Call)
+                    
                     if self.MPDS_Call.colour in ['purple', 'red']:
                         self.hold(90)
                     elif self.MPDS_Call.colour in ['orange', 'yellow']:
@@ -144,26 +181,31 @@ class calltaker(sim.Component):
             while len(emct_Q) == 0:
                 self.passivate()
             self.current_call = emct_Q.pop()
+            active_emct_monitor.tally(active_emct_monitor.value + 1)
             self.hold(sim.Uniform(1, 10).sample())
-            self.current_call.colour = random.choices(population=event_colours, weights=[10, 20, 30, 30, 10], k=1)[0]
+            self.current_call.colour = random.choices(population=event_colours, weights=[3, 35, 28, 32, 2], k=1)[0]
             self.current_call.activate()
+            active_emct_monitor.tally(active_emct_monitor.value - 1)
+
 
 class ReassessmentTimer(sim.Component):
-    def setup(self,call):
+    def setup(self, call):
         self.call = call
+        self.active = True
     def process(self):
-        while True:
+        while self.active:
             self.hold(rea_timeframe)
-            if self.call in colour_queues[self.call.colour]:
-                self.call.enter(rea_Q)
-                for reassessor in Reassessors:
-                    if reassessor.ispassive():
-                        reassessor.activate()
-                        break
-                self.passivate()
-                self.passivate()
-            else:
+
+            if self.active and self.call in colour_queues.get(self.call.colour, []):
+                if self.call not in rea_Q:
+                    self.call.enter(rea_Q)
+                    for reassessor in Reassessors:
+                        if reassessor.ispassive():
+                            reassessor.activate()
+                            break
+            elif not self.active:
                 break
+
 
 class ReassessmentEMCT(sim.Component):
     def process(self):
@@ -173,12 +215,18 @@ class ReassessmentEMCT(sim.Component):
             patient = rea_Q.pop()
             active_reassessor_monitor.tally(active_reassessor_monitor.value + 1)
             self.hold(sim.Triangular(2,5,4).sample())
-            if sim.Uniform(0,1).sample() < 0.05:
+            still_waiting = patient in colour_queues.get(patient.colour, [])
+            if sim.Uniform(0, 1).sample() < 0.05:
+                patient.reassessment_timer.active = False
                 patient.cancel()
-            else:
-                if patient.reassessment_timer is not None:
-                    patient.reassessment_timer.activate()
-                patient.activate()
+            elif still_waiting:
+                # this whole try/except block is dumb - I get an error when I tried to just do enter that some calls were already in there despite being popped minutes ago.
+                try:
+                    patient.leave(rea_Q)
+                except ValueError:
+                    pass
+                finally:
+                    patient.enter(rea_Q)
             active_reassessor_monitor.tally(active_reassessor_monitor.value - 1)
 
 env.processed_count = 0
@@ -198,14 +246,14 @@ Reassessors = [ReassessmentEMCT() for _ in range(reassessor_count)]
 sim.AnimateText(
     text=lambda: f"Teal Queue: {len(teal_Q)}",
     x=50,
-    y=120,
+    y=150,
     fontsize=20,
     textcolor='teal'
 )
 sim.AnimateRectangle(
     spec=lambda: (0, 0, len(teal_Q) * 10, 20),
     x=250,
-    y=115,
+    y=145,
     fillcolor='teal'
 )
 
@@ -213,7 +261,7 @@ sim.AnimateRectangle(
 sim.AnimateText(
     text=lambda: f"Yellow Queue: {len(yellow_Q)}",
     x=50,
-    y=90,
+    y=120,
     fontsize=20,
     textcolor='yellow'
 )
@@ -221,21 +269,21 @@ sim.AnimateText(
 sim.AnimateRectangle(
     spec=lambda: (0, 0, len(yellow_Q) * 10, 20),
     x=250,
-    y=85,
+    y=115,
     fillcolor='yellow'
 )
 #Orange Q visual
 sim.AnimateText(
     text=lambda: f"Orange Queue: {len(orange_Q)}",
     x=50,
-    y=60,
+    y=90,
     fontsize=20,
     textcolor='orange'
 )
 sim.AnimateRectangle(
     spec=lambda: (0, 0, len(orange_Q) * 10, 20),
     x=250,
-    y=55,
+    y=85,
     fillcolor='orange'
 )
 
@@ -243,48 +291,81 @@ sim.AnimateRectangle(
 sim.AnimateText(
     text=lambda: f"Red Queue: {len(red_Q)}",
     x=50,
-    y=30,
+    y=60,
     fontsize=20,
     textcolor='red'
 )
 sim.AnimateRectangle(
     spec=lambda: (0, 0, len(red_Q) * 10, 20),
     x=250,
-    y=25,
+    y=55,
     fillcolor='red'
 )
+#Purple Q visual
+sim.AnimateText(
+    text=lambda: f"Purple Queue: {len(purple_Q)}",
+    x=50,
+    y=30,
+    fontsize=20,
+    textcolor='purple'
+)
+sim.AnimateRectangle(
+    spec=lambda: (0, 0, len(purple_Q) * 10, 20),
+    x=250,
+    y=25,
+    fillcolor='purple'
+)
 
-#Active STC visual
-sim.AnimateMonitor(active_stc_monitor, x=10, y=570, width=480, height=100, horizontal_scale=5, vertical_scale=5)
+#Active Colour visual
+sim.AnimateMonitor(purple_Q.length_of_stay, x=10, y=520, width=700, height=150, horizontal_scale=5, vertical_scale=20, linecolor='purple', title = '')
+sim.AnimateMonitor(red_Q.length_of_stay, x=10, y=520, width=700, height=150, horizontal_scale=5, vertical_scale=20, linecolor='red', title = '')
+sim.AnimateMonitor(orange_Q.length_of_stay, x=10, y=520, width=700, height=150, horizontal_scale=5, vertical_scale=20, linecolor='orange', title = '')
+sim.AnimateMonitor(yellow_Q.length_of_stay, x=10, y=520, width=700, height=150, horizontal_scale=5, vertical_scale=20, linecolor='yellow', fillcolor='#D3D3D3', title = 'length of stay in queue')
 
+#Active STC Visual
 sim.AnimateText(
     text=lambda: f"Active STC: {active_stc_monitor.value}",
     x=50,
-    y=550,
+    y=490,
     fontsize=20,
     textcolor='teal'
 )
 sim.AnimateText(
     text=lambda: f"Available STC: {stc_count-(active_stc_monitor.value)}",
     x=50,
-    y=520,
+    y=460,
+    fontsize=20,
+    textcolor='teal'
+)
+# Bounced teals visual
+sim.AnimateText(
+    text=lambda: f"Bounced Teals: {env.teal_bounces}",
+    x=50,
+    y=430,
+    fontsize=20,
+    textcolor='teal'
+)
+# STC Closed visual
+sim.AnimateText(
+    text=lambda: f"STC Closed Calls: {env.stc_closed_count}",
+    x=50,
+    y=390,
     fontsize=20,
     textcolor='teal'
 )
 
 #Active Ambulances visual
-
 sim.AnimateText(
     text=lambda: f"Active Ambulances: {active_ambulance_monitor.value}",
     x=300,
-    y=550,
+    y=490,
     fontsize=20,
     textcolor='black'
 )
 sim.AnimateText(
     text=lambda: f"Available Ambulances: {ambulance_count-(active_ambulance_monitor.value)}",
     x=300,
-    y=520,
+    y=460,
     fontsize=20,
     textcolor='black'
 )
@@ -293,40 +374,45 @@ sim.AnimateText(
 sim.AnimateText(
     text=lambda: f"Active REA: {active_reassessor_monitor.value}",
     x=300,
-    y=450,
+    y=420,
     fontsize=20,
     textcolor='black'
 )
 sim.AnimateText(
     text=lambda: f"Available REA: {reassessor_count-(active_reassessor_monitor.value)}",
     x=300,
-    y=420,
+    y=390,
     fontsize=20,
     textcolor='black'
 )
-
 sim.AnimateText(
     text=lambda: f"REA Waiting: {rea_Q.length()}",
-    x=600,
-    y=480,
+    x=300,
+    y=360,
     fontsize=20,
     textcolor='black'
 )
-
-# Bounced teals visual
+# EMCT Data
 sim.AnimateText(
-    text=lambda: f"Bounced Teals: {env.teal_bounces}",
-    x=600,
-    y=60,
+    text=lambda: f"911 Waiting: {emct_Q.length()}",
+    x=300,
+    y=300,
     fontsize=20,
-    textcolor='green'
+    textcolor='black'
 )
-
-sim.AnimateRectangle(
-    spec=lambda: (0, 0, env.processed_count * 2, 20),
-    x=250,
-    y=55,
-    fillcolor='green'
+sim.AnimateText(
+    text=lambda: f"Active EMCT: {active_emct_monitor.value}",
+    x=300,
+    y=270,
+    fontsize=20,
+    textcolor='black'
+)
+sim.AnimateText(
+    text=lambda: f"Available EMCT: {(calltaker_count-(active_emct_monitor.value))}",
+    x=300,
+    y=240,
+    fontsize=20,
+    textcolor='black'
 )
 
 # Speed display
@@ -345,17 +431,17 @@ def set_speed_10():
     env.speed(10)
 def set_speed_100():
     env.speed(100)
-def set_speed_1000():
-    env.speed(1000)
+def set_speed_40():
+    env.speed(40)
 
 sim.AnimateButton(text="1x", x=50, y=700, action=set_speed_1)
 sim.AnimateButton(text="10x", x=120, y=700, action=set_speed_10)
-sim.AnimateButton(text="100x", x=190, y=700, action=set_speed_100)
-sim.AnimateButton(text="1000x", x=260, y=700, action=set_speed_1000)
+sim.AnimateButton(text="40x", x=190, y=700, action=set_speed_40)
+sim.AnimateButton(text="100x", x=260, y=700, action=set_speed_100)
 
 
 try:
-    env.run(till=1000)
+    env.run(till=10000)
 except sim.SimulationStopped:
     print("\nSimulation was stopped by user (animation window closed).")
     print(f"Simulation ended at time: {env.now()}")
